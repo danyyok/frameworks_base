@@ -3470,28 +3470,11 @@ class StorageManagerService extends IStorageManager.Stub
                     try {
                         // Mirror what vold would do: give the directory to the app uid
                         // with the shared gid so both the app and group members can access it.
+                        // Use 0771 (rwxrwx--x) so that 'other' processes (e.g. a different
+                        // uid downloading into this dir via DownloadManager) can still
+                        // traverse into subdirectories.
                         int gid = UserHandle.getSharedAppGid(uid);
-                        Os.chown(path, uid, gid);
-                        Os.chmod(path, OsConstants.S_IRWXU | OsConstants.S_IRWXG
-                                | OsConstants.S_IXOTH);
-                        // Also fix ownership on files already present in the directory
-                        File dir = new File(path);
-                        File[] children = dir.listFiles();
-                        if (children != null) {
-                            for (File child : children) {
-                                Os.chown(child.getAbsolutePath(), uid, gid);
-                                if (child.isDirectory()) {
-                                    Os.chmod(child.getAbsolutePath(),
-                                            OsConstants.S_IRWXU | OsConstants.S_IRWXG
-                                            | OsConstants.S_IXOTH);
-                                } else {
-                                    Os.chmod(child.getAbsolutePath(),
-                                            OsConstants.S_IRUSR | OsConstants.S_IWUSR
-                                            | OsConstants.S_IRGRP | OsConstants.S_IWGRP
-                                            | OsConstants.S_IXOTH);
-                                }
-                            }
-                        }
+                        fixupAppDirRecursive(path, uid, gid);
                     } catch (ErrnoException fallbackEx) {
                         Slog.e(TAG, "fixupAppDir: chown fallback also failed for "
                                 + packageName + ": " + fallbackEx.getMessage());
@@ -3508,6 +3491,46 @@ class StorageManagerService extends IStorageManager.Stub
             Log.e(TAG, "Path " + path + " is not a valid application-specific directory");
         }
     }
+        }
+
+    /**
+     * Recursively applies ownership (uid/gid) and permissions to {@code path} and all
+     * of its descendants.  This is the fallback used when the underlying filesystem does
+     * not support project-quota (e.g. f2fs formatted without the project_quota feature).
+     *
+     * Directory mode: 0771 (rwxrwx--x) — owner+group have full access; others get
+     *   execute/traverse so that a process running under a different uid (e.g.
+     *   DownloadManager writing into a sub-directory) can still traverse into it, while
+     *   still being able to read files whose mode allows it.
+     *
+     * File mode: 0664 (rw-rw-r--) — owner+group read/write; others read-only so that
+     *   the app that owns the directory can read files written by DownloadManager.
+     */
+    private void fixupAppDirRecursive(String path, int uid, int gid) throws ErrnoException {
+        // 0771 = rwxrwx--x  (S_IRWXU | S_IRWXG | S_IXOTH)
+        final int dirMode  = OsConstants.S_IRWXU | OsConstants.S_IRWXG | OsConstants.S_IXOTH;
+        // 0664 = rw-rw-r--  (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH)
+        final int fileMode = OsConstants.S_IRUSR | OsConstants.S_IWUSR
+                | OsConstants.S_IRGRP | OsConstants.S_IWGRP | OsConstants.S_IROTH;
+
+        Os.chown(path, uid, gid);
+        Os.chmod(path, dirMode);
+
+        File dir = new File(path);
+        File[] children = dir.listFiles();
+        if (children == null) return;
+
+        for (File child : children) {
+            String childPath = child.getAbsolutePath();
+            Os.chown(childPath, uid, gid);
+            if (child.isDirectory()) {
+                // Recurse into subdirectories (e.g. cache/, files/)
+                fixupAppDirRecursive(childPath, uid, gid);
+            } else {
+                Os.chmod(childPath, fileMode);
+            }
+        }
+    
 
     /*
      * Disable storage's app data isolation for testing.
